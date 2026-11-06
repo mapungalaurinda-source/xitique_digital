@@ -1,120 +1,209 @@
-import 'package:flutter/material.dart';
 
+// XITIQUE DIGITAL - Versao 1: ecra de grupos com SQLite
+
+
+import 'package:flutter/material.dart';
+// Usamos "as p" para evitar conflito com o "context" do Flutter
+import 'package:path/path.dart' as p;
+import 'package:sqflite/sqflite.dart';
+
+// Funcao principal: e aqui que a app comeca
 void main() {
-  runApp(const MyApp());
+  runApp(const XitiqueApp());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+// Widget raiz da app: define o titulo, o tema e o ecra inicial
+class XitiqueApp extends StatelessWidget {
+  const XitiqueApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
-      theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: .fromSeed(seedColor: Colors.deepPurple),
-      ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      title: 'Xitique Digital',
+      debugShowCheckedModeBanner: false, // esconde a faixa "debug"
+      theme: ThemeData(colorSchemeSeed: Colors.green, useMaterial3: true),
+      home: const GruposPage(), // primeiro ecra a ser mostrado
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
 
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
+// BASE DE DADOS (SQLite)
 
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
+class Db {
+  // Guarda a ligacao a base de dados para nao abrir varias vezes
+  static Database? _db;
 
-  final String title;
+  // Abre a base de dados (e cria a tabela na primeira vez)
+  static Future<Database> abrir() async {
+    // Se ja esta aberta, devolve a mesma
+    if (_db != null) return _db!;
 
-  @override
-  State<MyHomePage> createState() => _MyHomePageState();
-}
+    // Caminho do ficheiro da base de dados no telemovel
+    final caminho = p.join(await getDatabasesPath(), 'xitique.db');
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
-
-  void _incrementCounter() {
-    setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
-    });
+    _db = await openDatabase(
+      caminho,
+      version: 1,
+      // onCreate corre apenas quando a base de dados e criada
+      onCreate: (db, versao) async {
+        await db.execute(
+          'CREATE TABLE grupos ('
+          'id INTEGER PRIMARY KEY AUTOINCREMENT, '
+          'nome TEXT NOT NULL, '
+          'valor REAL NOT NULL)',
+        );
+      },
+    );
+    return _db!;
   }
 
+  // Devolve todos os grupos, do mais recente para o mais antigo
+  static Future<List<Map<String, dynamic>>> listarGrupos() async {
+    final db = await abrir();
+    return db.query('grupos', orderBy: 'id DESC');
+  }
+
+  // Insere um grupo novo na tabela
+  static Future<void> criarGrupo(String nome, double valor) async {
+    final db = await abrir();
+    await db.insert('grupos', {'nome': nome, 'valor': valor});
+  }
+
+  // Apaga o grupo que tem o id indicado
+  static Future<void> eliminarGrupo(int id) async {
+    final db = await abrir();
+    await db.delete('grupos', where: 'id = ?', whereArgs: [id]);
+  }
+}
+
+// ECRA: LISTA DE GRUPOS
+
+class GruposPage extends StatefulWidget {
+  const GruposPage({super.key});
+
   @override
-  Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
-    return Scaffold(
-      appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
-      ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: .center,
+  State<GruposPage> createState() => _GruposPageState();
+}
+
+class _GruposPageState extends State<GruposPage> {
+  // Lista de grupos que aparece no ecra
+  List<Map<String, dynamic>> grupos = [];
+
+  // initState corre uma vez, quando o ecra abre
+  @override
+  void initState() {
+    super.initState();
+    carregar(); // carrega os grupos guardados
+  }
+
+  // Le os grupos da base de dados e atualiza o ecra
+  Future<void> carregar() async {
+    final dados = await Db.listarGrupos();
+    setState(() => grupos = dados);
+  }
+
+  // Mostra a janela para criar um grupo novo
+  Future<void> novoGrupo() async {
+    // Controladores guardam o texto escrito nas caixas
+    final nomeCtrl = TextEditingController();
+    final valorCtrl = TextEditingController();
+
+    // Abre a janela de dialogo e espera pela resposta (true = guardar)
+    final guardar = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Novo grupo de xitique'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+            // Caixa para o nome do grupo
+            TextField(
+              controller: nomeCtrl,
+              decoration: const InputDecoration(labelText: 'Nome do grupo'),
+            ),
+            // Caixa para o valor da contribuicao (so numeros)
+            TextField(
+              controller: valorCtrl,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: 'Valor da contribuicao (MZN)',
+              ),
             ),
           ],
         ),
+        actions: [
+          // Botao cancelar: fecha a janela sem guardar
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancelar'),
+          ),
+          // Botao guardar: fecha a janela e devolve true
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Guardar'),
+          ),
+        ],
       ),
+    );
+
+    // Se o utilizador carregou em Guardar
+    if (guardar == true) {
+      final nome = nomeCtrl.text.trim(); // remove espacos extra
+      final valor = double.tryParse(valorCtrl.text.trim()) ?? 0;
+
+      // So guarda se o nome nao for vazio e o valor for maior que zero
+      if (nome.isNotEmpty && valor > 0) {
+        await Db.criarGrupo(nome, valor);
+        await carregar(); // atualiza a lista no ecra
+      }
+    }
+  }
+
+  // Constroi o desenho do ecra
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      // Barra do topo com o titulo
+      appBar: AppBar(title: const Text('Xitique Digital')),
+
+      // Se nao ha grupos, mostra uma mensagem; senao mostra a lista
+      body: grupos.isEmpty
+          ? const Center(
+              child: Text(
+                'Ainda nao tens grupos.\nCarrega no + para criar.',
+                textAlign: TextAlign.center,
+              ),
+            )
+          : ListView.builder(
+              itemCount: grupos.length,
+              itemBuilder: (context, i) {
+                final g = grupos[i]; // grupo atual da lista
+                return Card(
+                  margin: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 6,
+                  ),
+                  child: ListTile(
+                    leading: const Icon(Icons.groups),
+                    title: Text(g['nome']),
+                    subtitle: Text('${g['valor']} MZN por ronda'),
+                    // Botao do lixo: elimina o grupo
+                    trailing: IconButton(
+                      icon: const Icon(Icons.delete),
+                      onPressed: () async {
+                        await Db.eliminarGrupo(g['id']);
+                        await carregar(); // atualiza a lista
+                      },
+                    ),
+                  ),
+                );
+              },
+            ),
+
+      // Botao flutuante + para criar um grupo novo
       floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
+        onPressed: novoGrupo,
         child: const Icon(Icons.add),
       ),
     );
