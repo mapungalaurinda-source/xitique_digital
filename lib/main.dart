@@ -1,23 +1,64 @@
-// XITIQUE DIGITAL - Fase A
-// Grupos, membros, pagamentos com confirmacao, multa, fundo,
-// ordem (entrada / sorteio / escolha), desistencia e painel
+// Xitique Digital - Fase B
+// Temas, roleta, validacao de mensagens, perfil, cobranca e copia de seguranca
 
-
-import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 // Usamos "as p" para evitar conflito com o "context" do Flutter
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+// Tema (guardado na base de dados)
+final ValueNotifier<String> temaN = ValueNotifier<String>('sistema');
+final ValueNotifier<int> corN = ValueNotifier<int>(0);
+
+const List<Color> coresApp = [
+  Colors.green,
+  Colors.blue,
+  Colors.purple,
+  Colors.orange,
+  Colors.teal,
+  Colors.red,
+];
+
+// So mostramos cobranca por WhatsApp/SMS no Android
+bool get ehAndroid => defaultTargetPlatform == TargetPlatform.android;
 
 // Funcao principal: e aqui que a app comeca
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  // Le o tema guardado (se falhar usa o automatico)
+  try {
+    temaN.value = (await Db.lerConfig('tema')) ?? 'sistema';
+    final c = int.tryParse((await Db.lerConfig('cor')) ?? '') ?? 0;
+    corN.value = (c >= 0 && c < coresApp.length) ? c : 0;
+  } catch (_) {}
   runApp(const XitiqueApp());
 }
 
-// FUNCOES AUXILIARES
+// Constroi um tema a partir da cor e do brilho
+ThemeData construirTema(Color cor, Brightness b, {bool preto = false}) {
+  var esq = ColorScheme.fromSeed(seedColor: cor, brightness: b);
+  if (preto) {
+    // Tema preto: fundo totalmente preto (poupa bateria em ecras AMOLED)
+    esq = esq.copyWith(
+      surface: Colors.black,
+      surfaceContainerLow: const Color(0xFF121212),
+      surfaceContainer: const Color(0xFF1A1A1A),
+      surfaceContainerHigh: const Color(0xFF202020),
+    );
+  }
+  return ThemeData(
+    colorScheme: esq,
+    useMaterial3: true,
+    scaffoldBackgroundColor: preto ? Colors.black : null,
+  );
+}
 
+// Funcoes auxiliares
 
 // Mostra 500.0 como "500" e 12.5 como "12.50"
 String formatarValor(num v) {
@@ -88,7 +129,88 @@ Future<bool> confirmar(BuildContext context, String texto,
   return r == true;
 }
 
-// Resultado da leitura de uma mensagem M-Pesa / e-Mola
+// Janela que mostra uma lista de problemas
+Future<void> mostrarErros(BuildContext context, String titulo,
+    List<String> erros) async {
+  await showDialog<void>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: Text(titulo),
+      content: Text(erros.map((e) => '- $e').join('\n')),
+      actions: [
+        FilledButton(
+          onPressed: () => Navigator.pop(ctx),
+          child: const Text('OK'),
+        ),
+      ],
+    ),
+  );
+}
+
+// WhatsApp e SMS
+
+// Fica so com os digitos de um texto
+String soDigitos(String s) => s.replaceAll(RegExp(r'\D'), '');
+
+// Converte um telefone para formato internacional (Mocambique = 258)
+String telInternacional(String t) {
+  var d = soDigitos(t);
+  if (d.startsWith('00')) d = d.substring(2);
+  if (d.length == 9) d = '258$d';
+  return d;
+}
+
+// Abre um link noutra aplicacao (WhatsApp, SMS...)
+Future<void> abrirLink(BuildContext context, String url) async {
+  try {
+    final ok =
+        await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+    if (!ok && context.mounted) aviso(context, 'Nao foi possivel abrir.');
+  } catch (_) {
+    if (context.mounted) aviso(context, 'Nao foi possivel abrir.');
+  }
+}
+
+// Pergunta se quer enviar por WhatsApp ou SMS e abre com o texto pronto
+Future<void> cobrar(BuildContext context, String tel, String texto) async {
+  final msg = Uri.encodeComponent(texto);
+  final t = telInternacional(tel);
+  await showModalBottomSheet<void>(
+    context: context,
+    builder: (ctx) => SafeArea(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ListTile(
+            leading: const Icon(Icons.chat),
+            title: const Text('WhatsApp'),
+            subtitle: Text(t.isEmpty ? 'Escolher contacto' : '+$t'),
+            onTap: () {
+              Navigator.pop(ctx);
+              abrirLink(
+                  context,
+                  t.isEmpty
+                      ? 'https://wa.me/?text=$msg'
+                      : 'https://wa.me/$t?text=$msg');
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.sms),
+            title: const Text('SMS'),
+            onTap: () {
+              Navigator.pop(ctx);
+              abrirLink(context, 'sms:$t?body=$msg');
+            },
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+// Leitura e validacao de mensagens M-Pesa / e-Mola
+
+// Resultado da leitura de uma mensagem
 class ExtraidoMsg {
   final double? valor;
   final String? referencia;
@@ -96,7 +218,6 @@ class ExtraidoMsg {
 }
 
 // Tenta encontrar o valor e a referencia numa mensagem copiada
-// Atencao: e uma leitura simples, o utilizador deve sempre conferir
 ExtraidoMsg extrairMensagem(String texto) {
   double? valor;
   String? ref;
@@ -109,7 +230,7 @@ ExtraidoMsg extrairMensagem(String texto) {
     valor = double.tryParse(mv.group(1)!.replaceAll(',', '.'));
   }
 
-  // Procura um codigo de 8 a 14 caracteres com letras e numeros
+  // Procura um codigo de 8 a 14 caracteres com letras E numeros
   final rr = RegExp(r'\b(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*\d)[A-Z0-9]{8,14}\b');
   final mr = rr.firstMatch(texto);
   if (mr != null) ref = mr.group(0);
@@ -117,10 +238,73 @@ ExtraidoMsg extrairMensagem(String texto) {
   return ExtraidoMsg(valor, ref);
 }
 
+// Uma referencia valida tem 8 a 14 letras/numeros, com pelo menos uma de cada
+bool referenciaValida(String r) {
+  return RegExp(r'^(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*\d)[A-Z0-9]{8,14}$')
+      .hasMatch(r);
+}
 
-// CALCULOS (multa, fundo, score, estados)
-// Recebe os dados ja carregados e calcula tudo em memoria
+// Resultado da validacao
+class ResultadoMsg {
+  final String? referencia;
+  final List<String> erros; // impedem guardar
+  final List<String> avisos; // guardam como NAO CONFIRMADO
+  ResultadoMsg(this.referencia, this.erros, this.avisos);
+  bool get ok => erros.isEmpty;
+}
 
+// Valida uma mensagem colada
+// Atencao: as regras sao aproximadas e nao provam que a mensagem e verdadeira
+ResultadoMsg validarMensagem(String texto,
+    {double? valorDigitado, String numeroRecebe = ''}) {
+  final erros = <String>[];
+  final avisos = <String>[];
+  final t = texto.trim();
+  final baixo = t.toLowerCase();
+  final ex = extrairMensagem(t);
+
+  const palavras = [
+    'm-pesa',
+    'mpesa',
+    'e-mola',
+    'emola',
+    'mkesh',
+    'm-kesh',
+    'confirmad',
+    'transfer'
+  ];
+
+  if (t.length < 25) {
+    erros.add('A mensagem e demasiado curta para ser uma confirmacao.');
+  }
+  if (!palavras.any((w) => baixo.contains(w))) {
+    erros.add('Nao parece uma mensagem M-Pesa, e-Mola ou mKesh.');
+  }
+  if (ex.valor == null) {
+    erros.add('Nao encontrei o valor na mensagem (ex: 500.00MT).');
+  }
+  if (ex.referencia == null) {
+    erros.add('Nao encontrei a referencia da transacao.');
+  }
+  if (ex.valor != null &&
+      valorDigitado != null &&
+      (ex.valor! - valorDigitado).abs() > 0.009) {
+    erros.add('O valor da mensagem (${formatarValor(ex.valor!)}) e diferente '
+        'do valor digitado (${formatarValor(valorDigitado)}).');
+  }
+
+  // Se o grupo tem numero, a mensagem deve te-lo
+  final num = soDigitos(numeroRecebe);
+  if (num.length >= 9) {
+    final fim = num.substring(num.length - 9);
+    if (!soDigitos(t).contains(fim)) {
+      avisos.add('A mensagem nao mostra o numero do grupo ($fim).');
+    }
+  }
+  return ResultadoMsg(ex.referencia, erros, avisos);
+}
+
+// Calculos (multa, fundo, score, estados)
 class Calc {
   final Map<String, dynamic> grupo;
   final List<Map<String, dynamic>> membros; // ja ordenados
@@ -194,14 +378,19 @@ class Calc {
     return soDia(DateTime.now()).isAfter(venc) ? 1 : -1;
   }
 
+  // Numero de rondas em atraso de um membro
+  int atrasos(Map<String, dynamic> m) {
+    int n = 0;
+    for (var r = 0; r < rondas; r++) {
+      if (pontualidade(m, r) == 1) n++;
+    }
+    return n;
+  }
+
   // Multa total devida por um membro (todas as rondas atrasadas)
   double multaDe(Map<String, dynamic> m) {
     if (multaPct <= 0) return 0;
-    double total = 0;
-    for (var r = 0; r < rondas; r++) {
-      if (pontualidade(m, r) == 1) total += valor * multaPct / 100;
-    }
-    return total;
+    return atrasos(m) * valor * multaPct / 100;
   }
 
   // Score de confianca (0 a 100) ou null se ainda nao ha historico
@@ -294,6 +483,27 @@ class Calc {
         'que o grupo deve devolver.';
   }
 
+  // Mensagem de cobranca com as rondas ja vencidas e por pagar (ou null)
+  String? mensagemCobranca(Map<String, dynamic> m) {
+    final hoje = soDia(DateTime.now());
+    final id = m['id'] as int;
+    final linhas = <String>[];
+    double total = 0;
+    for (var r = 0; r < rondas; r++) {
+      final falta = valor - conf(id, r);
+      if (falta <= 0.001) continue;
+      final venc = soDia(dataDaRonda(grupo, r));
+      if (venc.isAfter(hoje)) continue;
+      linhas.add('- Ronda ${r + 1} (${formatarData(venc)}): '
+          '${formatarValor(falta)} MZN');
+      total += falta;
+    }
+    if (linhas.isEmpty) return null;
+    return 'Ola ${m['nome']}, lembrete do xitique "${grupo['nome']}". '
+        'Estao em falta:\n${linhas.join('\n')}\n'
+        'Total: ${formatarValor(total)} MZN. Obrigado!';
+  }
+
   // Resumo da ronda para copiar e colar no WhatsApp
   String resumoRonda(int r) {
     final sb = StringBuffer();
@@ -343,38 +553,49 @@ String textoEstado(Calc c, Map<String, dynamic> m, int r) {
   return t;
 }
 
-
-// WIDGET RAIZ DA APP
-
+// Widget raiz da app (reage a mudancas de tema)
 class XitiqueApp extends StatelessWidget {
   const XitiqueApp({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Xitique Digital',
-      debugShowCheckedModeBanner: false, // esconde a faixa "debug"
-      theme: ThemeData(colorSchemeSeed: Colors.green, useMaterial3: true),
-      home: const GruposPage(), // primeiro ecra a ser mostrado
+    return ValueListenableBuilder<String>(
+      valueListenable: temaN,
+      builder: (_, tema, __) => ValueListenableBuilder<int>(
+        valueListenable: corN,
+        builder: (_, ci, __) {
+          final cor = coresApp[ci];
+          return MaterialApp(
+            title: 'Xitique Digital',
+            debugShowCheckedModeBanner: false,
+            theme: construirTema(cor, Brightness.light),
+            darkTheme:
+                construirTema(cor, Brightness.dark, preto: tema == 'preto'),
+            themeMode: tema == 'claro'
+                ? ThemeMode.light
+                : (tema == 'escuro' || tema == 'preto')
+                    ? ThemeMode.dark
+                    : ThemeMode.system,
+            home: const GruposPage(),
+          );
+        },
+      ),
     );
   }
 }
 
-// BASE DE DADOS (SQLite) - versao 4
-
+// Base de dados (SQLite) - versao 5
 class Db {
-  // Guarda a ligacao a base de dados para nao abrir varias vezes
   static Database? _db;
 
   static Future<Database> abrir() async {
     if (_db != null) return _db!;
 
-    // Caminho do ficheiro da base de dados no telemovel
     final caminho = p.join(await getDatabasesPath(), 'xitique.db');
 
     _db = await openDatabase(
       caminho,
-      version: 4,
+      version: 5,
       // onCreate corre quando a base de dados e criada pela primeira vez
       onCreate: (db, versao) async {
         await db.execute(
@@ -386,7 +607,8 @@ class Db {
           'periodo INTEGER DEFAULT 1, '
           'multa_pct REAL DEFAULT 0, '
           'fundo_pct REAL DEFAULT 0, '
-          'modo_ordem INTEGER DEFAULT 0)',
+          'modo_ordem INTEGER DEFAULT 0, '
+          'numero_recebe TEXT)',
         );
         await db.execute(
           'CREATE TABLE membros ('
@@ -399,6 +621,8 @@ class Db {
           'pedido_ronda INTEGER)',
         );
         await _criarTabelaPagamentos(db);
+        await db.execute('ALTER TABLE pagamentos ADD COLUMN mensagem TEXT');
+        await _criarTabelaConfig(db);
       },
       // onUpgrade corre quando existe uma versao antiga da base de dados
       onUpgrade: (db, versaoAntiga, versaoNova) async {
@@ -417,24 +641,20 @@ class Db {
               'ALTER TABLE grupos ADD COLUMN periodo INTEGER DEFAULT 1');
         }
         if (versaoAntiga < 4) {
-          // Colunas novas dos grupos
           await db.execute(
               'ALTER TABLE grupos ADD COLUMN multa_pct REAL DEFAULT 0');
           await db.execute(
               'ALTER TABLE grupos ADD COLUMN fundo_pct REAL DEFAULT 0');
           await db.execute(
               'ALTER TABLE grupos ADD COLUMN modo_ordem INTEGER DEFAULT 0');
-          // Colunas novas dos membros
           await db.execute(
               'ALTER TABLE membros ADD COLUMN posicao INTEGER DEFAULT 0');
           await db.execute(
               'ALTER TABLE membros ADD COLUMN ativo INTEGER DEFAULT 1');
-          await db.execute('ALTER TABLE membros ADD COLUMN pedido_ronda INTEGER');
-          // Os membros antigos ficam na ordem em que foram criados
+          await db
+              .execute('ALTER TABLE membros ADD COLUMN pedido_ronda INTEGER');
           await db.execute('UPDATE membros SET posicao = id');
-          // Tabela nova de pagamentos
           await _criarTabelaPagamentos(db);
-          // Se vinha da versao 3, converte as contribuicoes antigas
           if (versaoAntiga >= 3) {
             await db.execute(
               'INSERT INTO pagamentos '
@@ -445,12 +665,17 @@ class Db {
             );
           }
         }
+        if (versaoAntiga < 5) {
+          // Numero do grupo, mensagem guardada e tabela de configuracao
+          await db.execute('ALTER TABLE grupos ADD COLUMN numero_recebe TEXT');
+          await db.execute('ALTER TABLE pagamentos ADD COLUMN mensagem TEXT');
+          await _criarTabelaConfig(db);
+        }
       },
     );
     return _db!;
   }
 
-  // Cada pagamento e um registo: quem, que ronda, quanto, quando, referencia
   static Future<void> _criarTabelaPagamentos(Database db) async {
     await db.execute(
       'CREATE TABLE pagamentos ('
@@ -465,9 +690,67 @@ class Db {
     );
   }
 
-  // GRUPOS 
+  // Tabela simples chave/valor para guardar o tema
+  static Future<void> _criarTabelaConfig(Database db) async {
+    await db.execute(
+      'CREATE TABLE IF NOT EXISTS config ('
+      'chave TEXT PRIMARY KEY, '
+      'valor TEXT)',
+    );
+  }
 
-  // Devolve todos os grupos, com o total de membros de cada um
+  // Configuracao
+
+  static Future<String?> lerConfig(String chave) async {
+    final db = await abrir();
+    final r = await db.query('config',
+        where: 'chave = ?', whereArgs: [chave], limit: 1);
+    if (r.isEmpty) return null;
+    return r.first['valor'] as String?;
+  }
+
+  static Future<void> guardarConfig(String chave, String valor) async {
+    final db = await abrir();
+    await db.insert('config', {'chave': chave, 'valor': valor},
+        conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  // Copia de seguranca
+
+  // Junta todos os dados num texto (JSON)
+  static Future<String> exportar() async {
+    final db = await abrir();
+    final dados = {
+      'app': 'xitique_digital',
+      'versao': 1,
+      'grupos': await db.query('grupos'),
+      'membros': await db.query('membros'),
+      'pagamentos': await db.query('pagamentos'),
+    };
+    return jsonEncode(dados);
+  }
+
+  // Apaga os dados atuais e carrega os da copia
+  static Future<void> importar(String texto) async {
+    final d = jsonDecode(texto);
+    if (d is! Map || d['app'] != 'xitique_digital') {
+      throw Exception('Copia invalida');
+    }
+    final db = await abrir();
+    await db.transaction((txn) async {
+      await txn.delete('pagamentos');
+      await txn.delete('membros');
+      await txn.delete('grupos');
+      for (final tabela in ['grupos', 'membros', 'pagamentos']) {
+        for (final linha in (d[tabela] as List)) {
+          await txn.insert(tabela, Map<String, Object?>.from(linha as Map));
+        }
+      }
+    });
+  }
+
+  // Grupos
+
   static Future<List<Map<String, dynamic>>> listarGrupos() async {
     final db = await abrir();
     return db.rawQuery(
@@ -478,9 +761,9 @@ class Db {
     );
   }
 
-  // Insere um grupo novo
   static Future<void> criarGrupo(String nome, double valor, int periodo,
-      DateTime inicio, double multa, double fundo, int modo) async {
+      DateTime inicio, double multa, double fundo, int modo,
+      String numero) async {
     final db = await abrir();
     await db.insert('grupos', {
       'nome': nome,
@@ -490,10 +773,10 @@ class Db {
       'multa_pct': multa,
       'fundo_pct': fundo,
       'modo_ordem': modo,
+      'numero_recebe': numero,
     });
   }
 
-  // Apaga o grupo e tudo o que pertence a ele
   static Future<void> eliminarGrupo(int id) async {
     final db = await abrir();
     await db.delete('pagamentos', where: 'grupo_id = ?', whereArgs: [id]);
@@ -501,9 +784,8 @@ class Db {
     await db.delete('grupos', where: 'id = ?', whereArgs: [id]);
   }
 
-  // MEMBROS 
+  // Membros
 
-  // Devolve os membros pela ordem de recebimento
   static Future<List<Map<String, dynamic>>> listarMembros(int grupoId) async {
     final db = await abrir();
     return db.query(
@@ -514,7 +796,6 @@ class Db {
     );
   }
 
-  // Insere um membro novo no fim da fila
   static Future<void> criarMembro(
       int grupoId, String nome, String telefone, int? pedido) async {
     final db = await abrir();
@@ -533,14 +814,12 @@ class Db {
     });
   }
 
-  // Apaga o membro e os pagamentos dele
   static Future<void> eliminarMembro(int id) async {
     final db = await abrir();
     await db.delete('pagamentos', where: 'membro_id = ?', whereArgs: [id]);
     await db.delete('membros', where: 'id = ?', whereArgs: [id]);
   }
 
-  // Marca o membro como ativo (true) ou desistiu (false)
   static Future<void> definirAtivo(int id, bool ativo) async {
     final db = await abrir();
     await db.update('membros', {'ativo': ativo ? 1 : 0},
@@ -558,9 +837,8 @@ class Db {
     await batch.commit(noResult: true);
   }
 
-  // PAGAMENTOS 
+  // Pagamentos
 
-  // Todos os pagamentos de um grupo
   static Future<List<Map<String, dynamic>>> listarPagamentos(
       int grupoId) async {
     final db = await abrir();
@@ -568,7 +846,6 @@ class Db {
         where: 'grupo_id = ?', whereArgs: [grupoId], orderBy: 'data ASC');
   }
 
-  // Pagamentos de um membro numa ronda
   static Future<List<Map<String, dynamic>>> listarPagamentosMembroRonda(
       int membroId, int ronda) async {
     final db = await abrir();
@@ -578,16 +855,20 @@ class Db {
         orderBy: 'data ASC');
   }
 
-  // Verifica se uma referencia ja foi usada
-  static Future<bool> referenciaExiste(String ref) async {
+  // Verifica se uma referencia ja foi usada (ignora um pagamento, se indicado)
+  static Future<bool> referenciaExiste(String ref, {int? ignorarId}) async {
     final db = await abrir();
     final r = await db.query('pagamentos',
-        where: 'referencia = ?', whereArgs: [ref], limit: 1);
+        where:
+            ignorarId == null ? 'referencia = ?' : 'referencia = ? AND id != ?',
+        whereArgs: ignorarId == null ? [ref] : [ref, ignorarId],
+        limit: 1);
     return r.isNotEmpty;
   }
 
   static Future<void> criarPagamento(int grupoId, int membroId, int ronda,
-      double valor, DateTime data, String ref) async {
+      double valor, DateTime data, String ref, String mensagem,
+      bool confirmado) async {
     final db = await abrir();
     await db.insert('pagamentos', {
       'grupo_id': grupoId,
@@ -596,14 +877,17 @@ class Db {
       'valor': valor,
       'data': data.toIso8601String(),
       'referencia': ref,
-      'confirmado': ref.isNotEmpty ? 1 : 0,
+      'mensagem': mensagem,
+      'confirmado': confirmado ? 1 : 0,
     });
   }
 
-  // Confirma um pagamento que estava sem referencia
-  static Future<void> confirmarPagamento(int id, String ref) async {
+  // Confirma um pagamento que estava por confirmar
+  static Future<void> confirmarPagamento(
+      int id, String ref, String mensagem) async {
     final db = await abrir();
-    await db.update('pagamentos', {'referencia': ref, 'confirmado': 1},
+    await db.update('pagamentos',
+        {'referencia': ref, 'mensagem': mensagem, 'confirmado': 1},
         where: 'id = ?', whereArgs: [id]);
   }
 
@@ -613,9 +897,7 @@ class Db {
   }
 }
 
-
-// ECRA 1: LISTA DE GRUPOS
-
+// Ecra 1: lista de grupos
 class GruposPage extends StatefulWidget {
   const GruposPage({super.key});
 
@@ -632,7 +914,6 @@ class _GruposPageState extends State<GruposPage> {
     carregar();
   }
 
-  // Le os grupos da base de dados e atualiza o ecra
   Future<void> carregar() async {
     final dados = await Db.listarGrupos();
     if (!mounted) return;
@@ -645,8 +926,9 @@ class _GruposPageState extends State<GruposPage> {
     final valorCtrl = TextEditingController();
     final multaCtrl = TextEditingController(text: '0');
     final fundoCtrl = TextEditingController(text: '0');
-    int periodo = 1; // 1 = mensal por defeito
-    int modo = 0; // 0 = ordem de entrada
+    final numCtrl = TextEditingController();
+    int periodo = 1;
+    int modo = 0;
     DateTime inicio = DateTime.now();
 
     final guardar = await showDialog<bool>(
@@ -670,6 +952,13 @@ class _GruposPageState extends State<GruposPage> {
                   ),
                 ),
                 TextField(
+                  controller: numCtrl,
+                  keyboardType: TextInputType.phone,
+                  decoration: const InputDecoration(
+                    labelText: 'Numero que recebe (M-Pesa/e-Mola)',
+                  ),
+                ),
+                TextField(
                   controller: multaCtrl,
                   keyboardType: TextInputType.number,
                   decoration: const InputDecoration(
@@ -684,7 +973,6 @@ class _GruposPageState extends State<GruposPage> {
                   ),
                 ),
                 const SizedBox(height: 16),
-                // Periodo: mensal ou semanal
                 DropdownButtonFormField<int>(
                   value: periodo,
                   decoration: const InputDecoration(labelText: 'Periodo'),
@@ -695,7 +983,6 @@ class _GruposPageState extends State<GruposPage> {
                   onChanged: (v) => setDialog(() => periodo = v ?? 1),
                 ),
                 const SizedBox(height: 8),
-                // Modo da ordem de recebimento
                 DropdownButtonFormField<int>(
                   value: modo,
                   isExpanded: true,
@@ -703,14 +990,13 @@ class _GruposPageState extends State<GruposPage> {
                       const InputDecoration(labelText: 'Ordem de recebimento'),
                   items: const [
                     DropdownMenuItem(value: 0, child: Text('Ordem de entrada')),
-                    DropdownMenuItem(value: 1, child: Text('Sorteio')),
+                    DropdownMenuItem(value: 1, child: Text('Sorteio (roleta)')),
                     DropdownMenuItem(
                         value: 2, child: Text('Cada um escolhe a ronda')),
                   ],
                   onChanged: (v) => setDialog(() => modo = v ?? 0),
                 ),
                 const SizedBox(height: 12),
-                // Data de inicio
                 OutlinedButton.icon(
                   icon: const Icon(Icons.calendar_month),
                   label: Text('Inicio: ${formatarData(inicio)}'),
@@ -753,15 +1039,14 @@ class _GruposPageState extends State<GruposPage> {
               .clamp(0.0, 100.0)
               .toDouble();
 
-      // So guarda se o nome nao for vazio e o valor for maior que zero
       if (nome.isNotEmpty && valor > 0) {
-        await Db.criarGrupo(nome, valor, periodo, inicio, multa, fundo, modo);
+        await Db.criarGrupo(nome, valor, periodo, inicio, multa, fundo, modo,
+            numCtrl.text.trim());
         await carregar();
       }
     }
   }
 
-  // Abre o ecra do grupo escolhido
   Future<void> abrirGrupo(Map<String, dynamic> g) async {
     await Navigator.push(
       context,
@@ -770,10 +1055,28 @@ class _GruposPageState extends State<GruposPage> {
     await carregar();
   }
 
+  Future<void> abrirConfig() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const ConfigPage()),
+    );
+    // Se restaurou uma copia, os grupos mudaram
+    await carregar();
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Xitique Digital')),
+      appBar: AppBar(
+        title: const Text('Xitique Digital'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings),
+            tooltip: 'Definicoes',
+            onPressed: abrirConfig,
+          ),
+        ],
+      ),
       body: grupos.isEmpty
           ? const Center(
               child: Text(
@@ -820,62 +1123,362 @@ class _GruposPageState extends State<GruposPage> {
   }
 }
 
-
-// JANELA DO SORTEIO (com animacao)
-
-class SorteioDialog extends StatefulWidget {
-  final List<Map<String, dynamic>> membros;
-
-  const SorteioDialog({super.key, required this.membros});
+// Ecra de definicoes (tema, cores e copia de seguranca)
+class ConfigPage extends StatefulWidget {
+  const ConfigPage({super.key});
 
   @override
-  State<SorteioDialog> createState() => _SorteioDialogState();
+  State<ConfigPage> createState() => _ConfigPageState();
 }
 
-class _SorteioDialogState extends State<SorteioDialog> {
-  late List<Map<String, dynamic>> lista;
-  Timer? _timer;
-  int ticks = 0;
-  bool terminou = false;
+class _ConfigPageState extends State<ConfigPage> {
+  static const Map<String, String> temas = {
+    'sistema': 'Automatico',
+    'claro': 'Claro',
+    'escuro': 'Escuro',
+    'preto': 'Preto',
+  };
+
+  // Copia todos os dados para a area de transferencia
+  Future<void> copiarSeguranca() async {
+    final texto = await Db.exportar();
+    await Clipboard.setData(ClipboardData(text: texto));
+    if (!mounted) return;
+    aviso(
+        context,
+        'Copia guardada na area de transferencia. '
+        'Cola num sitio seguro (notas, e-mail, WhatsApp para ti).');
+  }
+
+  // Restaura os dados a partir de um texto colado
+  Future<void> restaurar() async {
+    final ctrl = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Restaurar copia'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+                'Atencao: isto APAGA os dados atuais e coloca os da copia.',
+                style: TextStyle(fontSize: 12)),
+            TextField(
+              controller: ctrl,
+              maxLines: 5,
+              decoration: const InputDecoration(labelText: 'Cola aqui a copia'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancelar'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Restaurar'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    try {
+      await Db.importar(ctrl.text.trim());
+      if (!mounted) return;
+      aviso(context, 'Copia restaurada com sucesso.');
+    } catch (_) {
+      if (!mounted) return;
+      aviso(context, 'Copia invalida. Os dados nao foram alterados.');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Definicoes')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          const Text('Tema',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            children: temas.entries
+                .map((e) => ChoiceChip(
+                      label: Text(e.value),
+                      selected: temaN.value == e.key,
+                      onSelected: (_) async {
+                        temaN.value = e.key;
+                        await Db.guardarConfig('tema', e.key);
+                        setState(() {});
+                      },
+                    ))
+                .toList(),
+          ),
+          const SizedBox(height: 20),
+          const Text('Cor da app',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 12,
+            children: List.generate(coresApp.length, (i) {
+              return InkWell(
+                customBorder: const CircleBorder(),
+                onTap: () async {
+                  corN.value = i;
+                  await Db.guardarConfig('cor', '$i');
+                  setState(() {});
+                },
+                child: CircleAvatar(
+                  backgroundColor: coresApp[i],
+                  child: corN.value == i
+                      ? const Icon(Icons.check, color: Colors.white)
+                      : null,
+                ),
+              );
+            }),
+          ),
+          const SizedBox(height: 28),
+          const Text('Copia de seguranca',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          FilledButton.icon(
+            icon: const Icon(Icons.copy),
+            label: const Text('Copiar todos os dados'),
+            onPressed: copiarSeguranca,
+          ),
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            icon: const Icon(Icons.restore),
+            label: const Text('Restaurar de uma copia'),
+            onPressed: restaurar,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// Roleta da sorte
+// Cada giro decide quem recebe a posicao seguinte
+class RoletaPainter extends CustomPainter {
+  final List<String> nomes;
+  final double angulo; // rotacao atual da roda (radianos)
+
+  RoletaPainter({required this.nomes, required this.angulo});
+
+  static const List<Color> cores = [
+    Color(0xFFE53935),
+    Color(0xFF1E88E5),
+    Color(0xFF43A047),
+    Color(0xFFFB8C00),
+    Color(0xFF8E24AA),
+    Color(0xFF00ACC1),
+    Color(0xFFD81B60),
+    Color(0xFF6D4C41),
+  ];
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final c = size.center(Offset.zero);
+    final r = min(size.width, size.height) / 2 - 8;
+    final n = nomes.length;
+    if (n == 0) return;
+    final a = 2 * pi / n;
+    final rect = Rect.fromCircle(center: c, radius: r);
+
+    // Roda a roda toda em volta do centro
+    canvas.save();
+    canvas.translate(c.dx, c.dy);
+    canvas.rotate(angulo);
+    canvas.translate(-c.dx, -c.dy);
+
+    for (var i = 0; i < n; i++) {
+      final inicio = -pi / 2 + i * a;
+      // Fatia colorida
+      canvas.drawArc(
+          rect, inicio, a, true, Paint()..color = cores[i % cores.length]);
+      // Contorno branco
+      canvas.drawArc(
+          rect,
+          inicio,
+          a,
+          true,
+          Paint()
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 2
+            ..color = Colors.white);
+
+      // Nome escrito ao longo do raio
+      canvas.save();
+      canvas.translate(c.dx, c.dy);
+      canvas.rotate(inicio + a / 2);
+      final tp = TextPainter(
+        text: TextSpan(
+          text: nomes[i],
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: n > 8 ? 11 : 14,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+        maxLines: 1,
+        ellipsis: '...',
+      )..layout(maxWidth: r * 0.62);
+      tp.paint(canvas, Offset(r * 0.30, -tp.height / 2));
+      canvas.restore();
+    }
+    canvas.restore();
+
+    // Centro da roda
+    canvas.drawCircle(c, 16, Paint()..color = Colors.white);
+    canvas.drawCircle(
+        c,
+        16,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 3
+          ..color = Colors.black54);
+
+    // Ponteiro fixo no topo
+    final seta = Path()
+      ..moveTo(c.dx - 13, c.dy - r - 6)
+      ..lineTo(c.dx + 13, c.dy - r - 6)
+      ..lineTo(c.dx, c.dy - r + 22)
+      ..close();
+    canvas.drawPath(seta, Paint()..color = Colors.red);
+    canvas.drawPath(
+        seta,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2
+          ..color = Colors.white);
+  }
+
+  @override
+  bool shouldRepaint(covariant RoletaPainter old) => true;
+}
+
+class RoletaDialog extends StatefulWidget {
+  final List<Map<String, dynamic>> membros;
+
+  const RoletaDialog({super.key, required this.membros});
+
+  @override
+  State<RoletaDialog> createState() => _RoletaDialogState();
+}
+
+class _RoletaDialogState extends State<RoletaDialog>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl;
   final Random rnd = Random();
+
+  late List<Map<String, dynamic>> restantes; // ainda sem posicao
+  final List<Map<String, dynamic>> ordem = []; // ja sorteados
+  double angulo = 0;
+  double _inicio = 0;
+  double _fim = 0;
+  bool girando = false;
+
+  bool get terminou => restantes.isEmpty;
 
   @override
   void initState() {
     super.initState();
-    lista = List.of(widget.membros);
-    // A cada 120 ms embaralha a lista; depois de 16 vezes para
-    _timer = Timer.periodic(const Duration(milliseconds: 120), (t) {
-      ticks++;
-      setState(() => lista.shuffle(rnd));
-      if (ticks >= 16) {
-        t.cancel();
-        setState(() => terminou = true);
-      }
+    restantes = List.of(widget.membros);
+    _ctrl = AnimationController(
+        vsync: this, duration: const Duration(seconds: 4));
+    // A cada imagem calcula o angulo da roda (abranda no fim)
+    _ctrl.addListener(() {
+      setState(() {
+        angulo = _inicio +
+            (_fim - _inicio) * Curves.easeOutCubic.transform(_ctrl.value);
+      });
     });
   }
 
   @override
   void dispose() {
-    _timer?.cancel();
+    _ctrl.dispose();
     super.dispose();
+  }
+
+  // Gira a roda e escolhe um vencedor
+  Future<void> girar() async {
+    if (girando || restantes.length < 2) return;
+    final n = restantes.length;
+    final a = 2 * pi / n;
+    final w = rnd.nextInt(n); // indice do vencedor
+
+    // Pequena variacao para nao parar sempre no meio da fatia
+    final variacao = (rnd.nextDouble() - 0.5) * a * 0.7;
+    // Angulo em que o centro da fatia w fica debaixo do ponteiro
+    final alvo = (-(w * a + a / 2 + variacao)) % (2 * pi);
+    final atual = angulo % (2 * pi);
+    var delta = alvo - atual;
+    if (delta < 0) delta += 2 * pi;
+
+    _inicio = angulo;
+    _fim = angulo + delta + 2 * pi * (5 + rnd.nextInt(3)); // 5 a 7 voltas
+    setState(() => girando = true);
+    await _ctrl.forward(from: 0);
+    if (!mounted) return;
+
+    setState(() {
+      girando = false;
+      ordem.add(restantes[w]);
+      restantes.removeAt(w);
+      // O ultimo fica automaticamente na ultima posicao
+      if (restantes.length == 1) {
+        ordem.add(restantes.first);
+        restantes.clear();
+      }
+      angulo = 0;
+    });
   }
 
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: Text(terminou ? 'Ordem sorteada!' : 'A sortear...'),
+      title: Text(terminou ? 'Ordem sorteada!' : 'Roleta da sorte'),
       content: SizedBox(
         width: double.maxFinite,
         child: SingleChildScrollView(
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
+              if (!terminou)
+                SizedBox(
+                  width: 260,
+                  height: 260,
+                  child: CustomPaint(
+                    painter: RoletaPainter(
+                      nomes:
+                          restantes.map((m) => m['nome'].toString()).toList(),
+                      angulo: angulo,
+                    ),
+                  ),
+                ),
+              if (!terminou)
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  child: Text(
+                    girando
+                        ? 'A girar...'
+                        : 'Quem recebe na posicao ${ordem.length + 1}? '
+                            'Carrega em Girar.',
+                    textAlign: TextAlign.center,
+                  ),
+                ),
               ...List.generate(
-                lista.length,
+                ordem.length,
                 (i) => ListTile(
                   dense: true,
                   leading: CircleAvatar(radius: 14, child: Text('${i + 1}')),
-                  title: Text(lista[i]['nome'].toString()),
+                  title: Text(ordem[i]['nome'].toString()),
                 ),
               ),
             ],
@@ -884,25 +1487,27 @@ class _SorteioDialogState extends State<SorteioDialog> {
       ),
       actions: [
         TextButton(
-          onPressed: () => Navigator.pop(context),
+          onPressed: girando ? null : () => Navigator.pop(context),
           child: const Text('Cancelar'),
         ),
-        FilledButton(
-          onPressed: terminou
-              ? () => Navigator.pop(
-                  context, lista.map((m) => m['id'] as int).toList())
-              : null,
-          child: const Text('Aceitar'),
-        ),
+        if (!terminou)
+          FilledButton(
+            onPressed: girando ? null : girar,
+            child: const Text('Girar'),
+          ),
+        if (terminou)
+          FilledButton(
+            onPressed: () => Navigator.pop(
+                context, ordem.map((m) => m['id'] as int).toList()),
+            child: const Text('Aceitar'),
+          ),
       ],
     );
   }
 }
 
-
-// ECRA 2: DETALHES DO GRUPO (4 separadores)
-// Membros | Pagamentos | Calendario | Painel
-
+// Ecra 2: detalhes do grupo (4 separadores)
+// Membros, pagamentos, calendario e painel
 class GrupoPage extends StatefulWidget {
   final Map<String, dynamic> grupo;
 
@@ -918,8 +1523,8 @@ class _GrupoPageState extends State<GrupoPage>
 
   List<Map<String, dynamic>> membros = [];
   List<Map<String, dynamic>> pagamentos = [];
-  int rondaSel = 0; // ronda escolhida (comeca em 0)
-  bool _primeira = true; // para escolher a ronda inicial so uma vez
+  int rondaSel = 0;
+  bool _primeira = true;
 
   int get grupoId => widget.grupo['id'] as int;
   int get modo => (widget.grupo['modo_ordem'] ?? 0) as int;
@@ -939,7 +1544,6 @@ class _GrupoPageState extends State<GrupoPage>
     super.dispose();
   }
 
-  // Le tudo da base de dados e atualiza o ecra
   Future<void> carregar() async {
     final m = await Db.listarMembros(grupoId);
     final pg = await Db.listarPagamentos(grupoId);
@@ -962,7 +1566,7 @@ class _GrupoPageState extends State<GrupoPage>
     });
   }
 
-  // ACOES DOS MEMBROS 
+  // Acoes dos membros
 
   Future<void> novoMembro() async {
     final nomeCtrl = TextEditingController();
@@ -986,7 +1590,6 @@ class _GrupoPageState extends State<GrupoPage>
                 keyboardType: TextInputType.phone,
                 decoration: const InputDecoration(labelText: 'Telefone'),
               ),
-              // So aparece se o grupo for do tipo "cada um escolhe"
               if (modo == 2)
                 TextField(
                   controller: pedidoCtrl,
@@ -1021,7 +1624,7 @@ class _GrupoPageState extends State<GrupoPage>
     }
   }
 
-  // Sorteia a ordem de recebimento com animacao
+  // Sorteia a ordem de recebimento com a roleta
   Future<void> sortear() async {
     if (membros.length < 2) {
       aviso(context, 'Precisas de pelo menos 2 membros.');
@@ -1030,7 +1633,7 @@ class _GrupoPageState extends State<GrupoPage>
     final ordem = await showDialog<List<int>>(
       context: context,
       barrierDismissible: false,
-      builder: (_) => SorteioDialog(membros: membros),
+      builder: (_) => RoletaDialog(membros: membros),
     );
     if (ordem != null) {
       await Db.guardarOrdem(ordem);
@@ -1118,7 +1721,6 @@ class _GrupoPageState extends State<GrupoPage>
     final sobras = <Map<String, dynamic>>[];
     final relatorio = <String>[];
 
-    // Separa quem pediu uma ronda valida de quem nao pediu
     for (final m in membros) {
       final pr = m['pedido_ronda'];
       if (pr is int && pr >= 1 && pr <= n) {
@@ -1128,7 +1730,6 @@ class _GrupoPageState extends State<GrupoPage>
       }
     }
 
-    // Para cada ronda pedida, sorteia entre quem a quer
     final chaves = pedidos.keys.toList()..sort();
     for (final r in chaves) {
       final lista = pedidos[r]!;
@@ -1142,7 +1743,6 @@ class _GrupoPageState extends State<GrupoPage>
       }
     }
 
-    // Preenche as vagas livres com quem sobrou
     var j = 0;
     for (var i = 0; i < n; i++) {
       if (slots[i] == null) {
@@ -1187,7 +1787,19 @@ class _GrupoPageState extends State<GrupoPage>
     await carregar();
   }
 
-  //  SEPARADOR 1: MEMBROS 
+  // Abre o perfil de um membro
+  Future<void> abrirPerfil(Map<String, dynamic> m) async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) =>
+            PerfilMembroPage(grupo: widget.grupo, membroId: m['id'] as int),
+      ),
+    );
+    await carregar();
+  }
+
+  // Separador 1: membros
   Widget separadorMembros() {
     final c = calc;
     return Column(
@@ -1245,7 +1857,6 @@ class _GrupoPageState extends State<GrupoPage>
                       margin: const EdgeInsets.symmetric(
                           horizontal: 12, vertical: 4),
                       child: ListTile(
-                        // O numero e a ordem de recebimento
                         leading: CircleAvatar(child: Text('${i + 1}')),
                         title: Text(
                           ativo ? m['nome'] : '${m['nome']} (desistiu)',
@@ -1256,6 +1867,8 @@ class _GrupoPageState extends State<GrupoPage>
                           ),
                         ),
                         subtitle: Text(sub),
+                        // Tocar abre o perfil do membro
+                        onTap: () => abrirPerfil(m),
                         trailing: PopupMenuButton<String>(
                           onSelected: (v) async {
                             if (v == 'ativo') {
@@ -1299,7 +1912,7 @@ class _GrupoPageState extends State<GrupoPage>
     );
   }
 
-  //  SEPARADOR 2: PAGAMENTOS 
+  // Separador 2: pagamentos
   Widget separadorPagamentos() {
     if (membros.isEmpty) {
       return const Center(
@@ -1328,7 +1941,6 @@ class _GrupoPageState extends State<GrupoPage>
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                // Escolha da ronda
                 DropdownButton<int>(
                   value: rondaSel,
                   isExpanded: true,
@@ -1367,7 +1979,6 @@ class _GrupoPageState extends State<GrupoPage>
             itemCount: total,
             itemBuilder: (context, i) {
               final m = membros[i];
-              // Quem desistiu nao paga
               if (!c.ativo(m)) {
                 return ListTile(
                   enabled: false,
@@ -1395,7 +2006,7 @@ class _GrupoPageState extends State<GrupoPage>
     );
   }
 
-  // SEPARADOR 3: CALENDARIO 
+  // Separador 3: calendario
   Widget separadorCalendario() {
     if (membros.isEmpty) {
       return const Center(
@@ -1435,7 +2046,7 @@ class _GrupoPageState extends State<GrupoPage>
     );
   }
 
-  // SEPARADOR 4: PAINEL 
+  // Separador 4: painel
   Widget separadorPainel() {
     if (membros.isEmpty) {
       return const Center(
@@ -1449,7 +2060,6 @@ class _GrupoPageState extends State<GrupoPage>
     final c = calc;
     final cor = Theme.of(context).colorScheme.primary;
 
-    // Ranking de confianca: quem tem score primeiro, do maior para o menor
     final ranking = List<Map<String, dynamic>>.from(membros);
     ranking.sort((a, b) {
       final sa = c.score(a) ?? -1;
@@ -1457,7 +2067,6 @@ class _GrupoPageState extends State<GrupoPage>
       return sb.compareTo(sa);
     });
 
-    // Membros que desistiram
     final desistentes = <int>[];
     for (var i = 0; i < membros.length; i++) {
       if (!c.ativo(membros[i])) desistentes.add(i);
@@ -1478,7 +2087,6 @@ class _GrupoPageState extends State<GrupoPage>
     return ListView(
       padding: const EdgeInsets.all(12),
       children: [
-        // Numeros gerais
         Card(
           child: Padding(
             padding: const EdgeInsets.all(16),
@@ -1591,7 +2199,6 @@ class _GrupoPageState extends State<GrupoPage>
           ),
         ),
 
-        // Acerto de quem desistiu
         if (desistentes.isNotEmpty)
           Card(
             child: Padding(
@@ -1612,7 +2219,7 @@ class _GrupoPageState extends State<GrupoPage>
             ),
           ),
 
-        // Copiar resumo da ronda atual
+        // Copiar o resumo da ronda
         FilledButton.icon(
           icon: const Icon(Icons.copy),
           label: Text('Copiar resumo da ronda ${rondaSel + 1}'),
@@ -1623,6 +2230,16 @@ class _GrupoPageState extends State<GrupoPage>
             aviso(context, 'Resumo copiado. Cola no WhatsApp.');
           },
         ),
+        // Enviar o resumo pelo WhatsApp (so no Android)
+        if (ehAndroid) ...[
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            icon: const Icon(Icons.chat),
+            label: Text('Enviar resumo da ronda ${rondaSel + 1} por WhatsApp'),
+            onPressed: () => abrirLink(context,
+                'https://wa.me/?text=${Uri.encodeComponent(c.resumoRonda(rondaSel))}'),
+          ),
+        ],
         const SizedBox(height: 24),
       ],
     );
@@ -1633,7 +2250,6 @@ class _GrupoPageState extends State<GrupoPage>
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.grupo['nome']),
-        // Menu de ordem so aparece no separador Membros
         actions: _tab.index == 0
             ? [
                 PopupMenuButton<String>(
@@ -1644,7 +2260,7 @@ class _GrupoPageState extends State<GrupoPage>
                   },
                   itemBuilder: (_) => [
                     const PopupMenuItem(
-                        value: 'sorteio', child: Text('Sortear ordem')),
+                        value: 'sorteio', child: Text('Roleta: sortear ordem')),
                     const PopupMenuItem(
                         value: 'troca', child: Text('Trocar posicoes')),
                     if (modo == 2)
@@ -1685,8 +2301,133 @@ class _GrupoPageState extends State<GrupoPage>
   }
 }
 
-// ECRA 3: PAGAMENTOS DE UM MEMBRO NUMA RONDA
+// Ecra: perfil de um membro
+class PerfilMembroPage extends StatefulWidget {
+  final Map<String, dynamic> grupo;
+  final int membroId;
 
+  const PerfilMembroPage(
+      {super.key, required this.grupo, required this.membroId});
+
+  @override
+  State<PerfilMembroPage> createState() => _PerfilMembroPageState();
+}
+
+class _PerfilMembroPageState extends State<PerfilMembroPage> {
+  List<Map<String, dynamic>> membros = [];
+  List<Map<String, dynamic>> pagamentos = [];
+  bool carregado = false;
+
+  @override
+  void initState() {
+    super.initState();
+    carregar();
+  }
+
+  Future<void> carregar() async {
+    final gid = widget.grupo['id'] as int;
+    final m = await Db.listarMembros(gid);
+    final pg = await Db.listarPagamentos(gid);
+    if (!mounted) return;
+    setState(() {
+      membros = m;
+      pagamentos = pg;
+      carregado = true;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!carregado) {
+      return Scaffold(
+        appBar: AppBar(),
+        body: const Center(child: CircularProgressIndicator()),
+      );
+    }
+    final idx = membros.indexWhere((m) => m['id'] == widget.membroId);
+    if (idx < 0) {
+      return Scaffold(
+        appBar: AppBar(),
+        body: const Center(child: Text('Membro nao encontrado.')),
+      );
+    }
+
+    final c = Calc(widget.grupo, membros, pagamentos);
+    final m = membros[idx];
+    final sc = c.score(m);
+    final tel = (m['telefone'] ?? '').toString();
+    final mensagem = c.mensagemCobranca(m);
+
+    return Scaffold(
+      appBar: AppBar(title: Text(m['nome'])),
+      body: ListView(
+        padding: const EdgeInsets.all(12),
+        children: [
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(c.ativo(m) ? 'Membro ativo' : 'Desistiu',
+                      style: const TextStyle(
+                          fontSize: 16, fontWeight: FontWeight.bold)),
+                  Text('Telefone: ${tel.isEmpty ? '-' : tel}'),
+                  Text('Recebe na ronda ${idx + 1} em '
+                      '${formatarData(dataDaRonda(widget.grupo, idx))}'
+                      '${c.completa(idx) ? ' (ronda completa)' : ''}'),
+                  const Divider(height: 24),
+                  Text('Total pago: ${formatarValor(c.pagoPor(m['id']))} MZN'),
+                  Text('Rondas em atraso: ${c.atrasos(m)}'),
+                  Text('Multa devida: ${formatarValor(c.multaDe(m))} MZN'),
+                  Text('Score de confianca: '
+                      '${sc == null ? 'sem dados' : '${sc.round()}%'}'),
+                ],
+              ),
+            ),
+          ),
+          if (ehAndroid)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: FilledButton.icon(
+                icon: const Icon(Icons.send),
+                label: const Text('Cobrar valores em atraso'),
+                onPressed: () {
+                  if (mensagem == null) {
+                    aviso(context, 'Nao ha valores em atraso.');
+                  } else {
+                    cobrar(context, tel, mensagem);
+                  }
+                },
+              ),
+            ),
+          const SizedBox(height: 8),
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 4),
+            child: Text('Historico por ronda',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          ),
+          ...List.generate(c.rondas, (r) {
+            final e = c.estado(m['id'], r);
+            return ListTile(
+              dense: true,
+              leading: e == 2
+                  ? const Icon(Icons.check_circle, color: Colors.green)
+                  : e == 1
+                      ? const Icon(Icons.timelapse, color: Colors.orange)
+                      : const Icon(Icons.radio_button_unchecked),
+              title: Text('Ronda ${r + 1} - '
+                  '${formatarData(dataDaRonda(widget.grupo, r))}'),
+              subtitle: Text(textoEstado(c, m, r)),
+            );
+          }),
+        ],
+      ),
+    );
+  }
+}
+
+// Ecra 3: pagamentos de um membro numa ronda
 class PagamentosMembroPage extends StatefulWidget {
   final Map<String, dynamic> grupo;
   final Map<String, dynamic> membro;
@@ -1709,6 +2450,7 @@ class _PagamentosMembroPageState extends State<PagamentosMembroPage> {
   int get grupoId => widget.grupo['id'] as int;
   int get membroId => widget.membro['id'] as int;
   double get valor => (widget.grupo['valor'] as num).toDouble();
+  String get numeroGrupo => (widget.grupo['numero_recebe'] ?? '').toString();
 
   @override
   void initState() {
@@ -1738,12 +2480,11 @@ class _PagamentosMembroPageState extends State<PagamentosMembroPage> {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                // Mensagem de confirmacao copiada do telemovel
                 TextField(
                   controller: msgCtrl,
                   maxLines: 3,
                   decoration: const InputDecoration(
-                    labelText: 'Colar mensagem M-Pesa / e-Mola (opcional)',
+                    labelText: 'Colar mensagem M-Pesa / e-Mola',
                   ),
                 ),
                 Align(
@@ -1772,6 +2513,7 @@ class _PagamentosMembroPageState extends State<PagamentosMembroPage> {
                 ),
                 TextField(
                   controller: refCtrl,
+                  textCapitalization: TextCapitalization.characters,
                   decoration: const InputDecoration(
                     labelText: 'Referencia da transacao',
                   ),
@@ -1792,7 +2534,7 @@ class _PagamentosMembroPageState extends State<PagamentosMembroPage> {
                 ),
                 const SizedBox(height: 8),
                 const Text(
-                  'Sem referencia, o pagamento fica NAO CONFIRMADO e nao conta ate ser confirmado.',
+                  'So fica CONFIRMADO com uma mensagem valida. Sem mensagem, fica NAO CONFIRMADO e nao conta.',
                   style: TextStyle(fontSize: 12),
                 ),
               ],
@@ -1815,33 +2557,66 @@ class _PagamentosMembroPageState extends State<PagamentosMembroPage> {
     if (ok != true) return;
 
     final v = double.tryParse(valorCtrl.text.trim().replaceAll(',', '.')) ?? 0;
-    final ref = refCtrl.text.trim();
+    var ref = refCtrl.text.trim().toUpperCase();
+    final msg = msgCtrl.text.trim();
+    bool confirmado = false;
+
     if (v <= 0) {
       if (!mounted) return;
       aviso(context, 'Valor invalido.');
       return;
     }
+
+    if (msg.isNotEmpty) {
+      // Ha mensagem: valida-a
+      final r =
+          validarMensagem(msg, valorDigitado: v, numeroRecebe: numeroGrupo);
+      if (!r.ok) {
+        if (!mounted) return;
+        await mostrarErros(context, 'Mensagem nao aceite', r.erros);
+        return;
+      }
+      if (ref.isNotEmpty && ref != r.referencia) {
+        if (!mounted) return;
+        await mostrarErros(context, 'Mensagem nao aceite', [
+          'A referencia digitada ($ref) e diferente da da mensagem (${r.referencia}).'
+        ]);
+        return;
+      }
+      ref = r.referencia!;
+      confirmado = r.avisos.isEmpty;
+      if (r.avisos.isNotEmpty && mounted) {
+        await mostrarErros(context, 'Guardado como NAO CONFIRMADO', r.avisos);
+      }
+    } else if (ref.isNotEmpty && !referenciaValida(ref)) {
+      if (!mounted) return;
+      aviso(context, 'Referencia invalida (8 a 14 letras e numeros).');
+      return;
+    }
+
     // A mesma referencia nao pode ser usada duas vezes
     if (ref.isNotEmpty && await Db.referenciaExiste(ref)) {
       if (!mounted) return;
       aviso(context, 'Esta referencia ja foi usada num pagamento.');
       return;
     }
-    await Db.criarPagamento(grupoId, membroId, widget.ronda, v, data, ref);
+    await Db.criarPagamento(
+        grupoId, membroId, widget.ronda, v, data, ref, msg, confirmado);
     await carregar();
   }
 
-  // Confirma um pagamento pedindo a referencia
+  // Confirma um pagamento colando a mensagem
   Future<void> confirmarPag(Map<String, dynamic> pg) async {
-    final refCtrl = TextEditingController();
+    final msgCtrl = TextEditingController();
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Confirmar pagamento'),
         content: TextField(
-          controller: refCtrl,
+          controller: msgCtrl,
+          maxLines: 4,
           decoration: const InputDecoration(
-            labelText: 'Referencia da transacao',
+            labelText: 'Cola a mensagem M-Pesa / e-Mola',
           ),
         ),
         actions: [
@@ -1857,14 +2632,26 @@ class _PagamentosMembroPageState extends State<PagamentosMembroPage> {
       ),
     );
     if (ok != true) return;
-    final ref = refCtrl.text.trim();
-    if (ref.isEmpty) return;
-    if (await Db.referenciaExiste(ref)) {
-      if (!mounted) return;
-      aviso(context, 'Esta referencia ja foi usada num pagamento.');
+
+    final msg = msgCtrl.text.trim();
+    final r = validarMensagem(msg,
+        valorDigitado: (pg['valor'] as num).toDouble(),
+        numeroRecebe: numeroGrupo);
+    if (!mounted) return;
+    if (!r.ok) {
+      await mostrarErros(context, 'Mensagem nao aceite', r.erros);
       return;
     }
-    await Db.confirmarPagamento(pg['id'], ref);
+    if (r.avisos.isNotEmpty) {
+      await mostrarErros(context, 'Nao foi confirmado', r.avisos);
+      return;
+    }
+    if (await Db.referenciaExiste(r.referencia!, ignorarId: pg['id'] as int)) {
+      if (!mounted) return;
+      aviso(context, 'Esta referencia ja foi usada noutro pagamento.');
+      return;
+    }
+    await Db.confirmarPagamento(pg['id'], r.referencia!, msg);
     await carregar();
   }
 
@@ -1882,10 +2669,35 @@ class _PagamentosMembroPageState extends State<PagamentosMembroPage> {
     }
     final progresso =
         valor > 0 ? (confirmado / valor).clamp(0.0, 1.0).toDouble() : 0.0;
+    final tel = (widget.membro['telefone'] ?? '').toString();
 
     return Scaffold(
       appBar: AppBar(
         title: Text('${widget.membro['nome']} - ronda ${widget.ronda + 1}'),
+        actions: ehAndroid
+            ? [
+                IconButton(
+                  icon: const Icon(Icons.send),
+                  tooltip: 'Cobrar',
+                  onPressed: () {
+                    final falta = valor - confirmado;
+                    if (falta <= 0.001) {
+                      aviso(context, 'Este membro ja pagou esta ronda.');
+                      return;
+                    }
+                    cobrar(
+                      context,
+                      tel,
+                      'Ola ${widget.membro['nome']}, lembrete do xitique '
+                      '"${widget.grupo['nome']}": falta ${formatarValor(falta)} MZN '
+                      'da ronda ${widget.ronda + 1} (vencimento '
+                      '${formatarData(dataDaRonda(widget.grupo, widget.ronda))}). '
+                      'Obrigado!',
+                    );
+                  },
+                ),
+              ]
+            : null,
       ),
       body: Column(
         children: [
@@ -1932,11 +2744,10 @@ class _PagamentosMembroPageState extends State<PagamentosMembroPage> {
                               ? const Icon(Icons.verified, color: Colors.green)
                               : const Icon(Icons.hourglass_empty,
                                   color: Colors.orange),
-                          title: Text(
-                              '${formatarValor(x['valor'] as num)} MZN'),
+                          title: Text('${formatarValor(x['valor'] as num)} MZN'),
                           subtitle: Text(
                             '${d == null ? '' : formatarData(d)} | '
-                            '${conf ? 'ref $ref' : 'NAO CONFIRMADO'}',
+                            '${conf ? 'ref $ref' : 'NAO CONFIRMADO${ref.isEmpty ? '' : ' (ref $ref)'}'}',
                           ),
                           trailing: Row(
                             mainAxisSize: MainAxisSize.min,
@@ -1944,7 +2755,7 @@ class _PagamentosMembroPageState extends State<PagamentosMembroPage> {
                               if (!conf)
                                 IconButton(
                                   icon: const Icon(Icons.check),
-                                  tooltip: 'Confirmar',
+                                  tooltip: 'Confirmar com mensagem',
                                   onPressed: () => confirmarPag(x),
                                 ),
                               IconButton(
