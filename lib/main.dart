@@ -1,6 +1,8 @@
-// Xitique Digital - Fase B
-// Temas, roleta, validacao de mensagens, perfil, cobranca e copia de seguranca
+// Xitique Digital - Versao final Android
+// Temas, roleta, validacao de mensagens, perfil, cobranca,
+// copia de seguranca, lembretes e relatorio
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/foundation.dart';
@@ -10,6 +12,7 @@ import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'lembretes.dart';
 
 // Tema (guardado na base de dados)
 final ValueNotifier<String> temaN = ValueNotifier<String>('sistema');
@@ -24,7 +27,7 @@ const List<Color> coresApp = [
   Colors.red,
 ];
 
-// So mostramos cobranca por WhatsApp/SMS no Android
+// So mostramos cobranca e lembretes no Android
 bool get ehAndroid => defaultTargetPlatform == TargetPlatform.android;
 
 // Funcao principal: e aqui que a app comeca
@@ -130,8 +133,8 @@ Future<bool> confirmar(BuildContext context, String texto,
 }
 
 // Janela que mostra uma lista de problemas
-Future<void> mostrarErros(BuildContext context, String titulo,
-    List<String> erros) async {
+Future<void> mostrarErros(
+    BuildContext context, String titulo, List<String> erros) async {
   await showDialog<void>(
     context: context,
     builder: (ctx) => AlertDialog(
@@ -531,6 +534,40 @@ class Calc {
         '${formatarValor(esperadoRonda)} MZN');
     return sb.toString();
   }
+
+  // Relatorio completo do grupo (para copiar)
+  String relatorioCompleto() {
+    final sb = StringBuffer();
+    sb.writeln('RELATORIO DO XITIQUE ${grupo['nome']}');
+    sb.writeln('Contribuicao: ${formatarValor(valor)} MZN '
+        '(${textoPeriodo((grupo['periodo'] ?? 1) as int)})');
+    sb.writeln('Membros: $rondas (ativos: $nAtivos)');
+    sb.writeln('Multa: ${formatarValor(multaPct)}% | '
+        'Fundo: ${formatarValor(fundoPct)}%');
+    sb.writeln('Recolhido: ${formatarValor(totalConf)} MZN | '
+        'Fundo: ${formatarValor(fundo)} MZN | '
+        'Multas devidas: ${formatarValor(multasTotal)} MZN');
+    sb.writeln('');
+    sb.writeln('Calendario:');
+    for (var i = 0; i < rondas; i++) {
+      final pct = esperadoRonda > 0
+          ? (brutoRonda(i) / esperadoRonda * 100).clamp(0.0, 100.0).round()
+          : 0;
+      sb.writeln('${i + 1}. ${membros[i]['nome']} - '
+          '${formatarData(dataDaRonda(grupo, i))} - '
+          '${completa(i) ? 'COMPLETA' : '$pct%'}');
+    }
+    sb.writeln('');
+    sb.writeln('Membros:');
+    for (final m in membros) {
+      final s = score(m);
+      sb.writeln('- ${m['nome']}${ativo(m) ? '' : ' (desistiu)'}: '
+          'pagou ${formatarValor(pagoPor(m['id'] as int))} MZN, '
+          'atrasos ${atrasos(m)}, '
+          'score ${s == null ? 'sem dados' : '${s.round()}%'}');
+    }
+    return sb.toString();
+  }
 }
 
 // Texto do estado de um membro numa ronda
@@ -551,6 +588,77 @@ String textoEstado(Calc c, Map<String, dynamic> m, int r) {
     t += ' | multa ${formatarValor(c.valor * c.multaPct / 100)}';
   }
   return t;
+}
+
+// Lembretes: calcula e agenda os avisos de todas as rondas
+
+// Um aviso por agendar
+class _Aviso {
+  final DateTime quando;
+  final String titulo;
+  final String corpo;
+  _Aviso(this.quando, this.titulo, this.corpo);
+}
+
+bool _agendando = false;
+
+// Apaga os lembretes antigos e agenda os novos (so Android)
+Future<void> reagendarLembretes() async {
+  if (!ehAndroid || _agendando) return;
+  _agendando = true;
+  try {
+    final ativo = (await Db.lerConfig('lembretes')) == '1';
+    await Lembretes.cancelarTodos();
+    if (!ativo) return;
+
+    final hora = int.tryParse((await Db.lerConfig('lembrete_hora')) ?? '') ?? 8;
+    final grupos = await Db.listarGrupos();
+    final avisos = <_Aviso>[];
+
+    for (final g in grupos) {
+      final membros = await Db.listarMembros(g['id'] as int);
+      final pags = await Db.listarPagamentos(g['id'] as int);
+      final c = Calc(g, membros, pags);
+      for (var r = 0; r < membros.length; r++) {
+        // Rondas ja completas nao precisam de aviso
+        if (c.completa(r)) continue;
+        final dia = soDia(dataDaRonda(g, r));
+        final recebe = membros[r]['nome'];
+        final valorRonda =
+            formatarValor(c.esperadoRonda * (1 - c.fundoPct / 100));
+        // Aviso no dia anterior
+        avisos.add(_Aviso(
+          DateTime(dia.year, dia.month, dia.day - 1, hora),
+          'Amanha: ronda ${r + 1} - ${g['nome']}',
+          '$recebe recebe $valorRonda MZN. Lembra o grupo de pagar.',
+        ));
+        // Aviso no proprio dia
+        avisos.add(_Aviso(
+          DateTime(dia.year, dia.month, dia.day, hora),
+          'Hoje: ronda ${r + 1} - ${g['nome']}',
+          'Vence hoje. Confere quem ainda nao pagou.',
+        ));
+      }
+    }
+
+    // Fica so com os futuros, os mais proximos primeiro (maximo 60)
+    final agora = DateTime.now();
+    avisos.removeWhere((a) => !a.quando.isAfter(agora));
+    avisos.sort((a, b) => a.quando.compareTo(b.quando));
+    final n = min(avisos.length, 60);
+    for (var i = 0; i < n; i++) {
+      await Lembretes.agendar(
+        id: i + 1,
+        quando: avisos[i].quando,
+        titulo: avisos[i].titulo,
+        corpo: avisos[i].corpo,
+      );
+    }
+  } catch (_) {
+    // Se algo falhar, a app continua a funcionar sem lembretes
+  } finally {
+    _agendando = false;
+  }
 }
 
 // Widget raiz da app (reage a mudancas de tema)
@@ -690,7 +798,7 @@ class Db {
     );
   }
 
-  // Tabela simples chave/valor para guardar o tema
+  // Tabela simples chave/valor para guardar o tema e os lembretes
   static Future<void> _criarTabelaConfig(Database db) async {
     await db.execute(
       'CREATE TABLE IF NOT EXISTS config ('
@@ -918,6 +1026,8 @@ class _GruposPageState extends State<GruposPage> {
     final dados = await Db.listarGrupos();
     if (!mounted) return;
     setState(() => grupos = dados);
+    // Sempre que os dados mudam, atualiza os lembretes
+    unawaited(reagendarLembretes());
   }
 
   // Mostra a janela para criar um grupo novo
@@ -1123,7 +1233,7 @@ class _GruposPageState extends State<GruposPage> {
   }
 }
 
-// Ecra de definicoes (tema, cores e copia de seguranca)
+// Ecra de definicoes (tema, lembretes e copia de seguranca)
 class ConfigPage extends StatefulWidget {
   const ConfigPage({super.key});
 
@@ -1138,6 +1248,69 @@ class _ConfigPageState extends State<ConfigPage> {
     'escuro': 'Escuro',
     'preto': 'Preto',
   };
+
+  bool lembretesAtivos = false;
+  int horaLembrete = 8;
+
+  @override
+  void initState() {
+    super.initState();
+    carregarLembretes();
+  }
+
+  // Le as definicoes de lembretes guardadas
+  Future<void> carregarLembretes() async {
+    final a = await Db.lerConfig('lembretes');
+    final h = int.tryParse((await Db.lerConfig('lembrete_hora')) ?? '') ?? 8;
+    if (!mounted) return;
+    setState(() {
+      lembretesAtivos = a == '1';
+      horaLembrete = h;
+    });
+  }
+
+  // Liga ou desliga os lembretes (pede permissao ao ligar)
+  Future<void> mudarLembretes(bool v) async {
+    if (v) {
+      final ok = await Lembretes.pedirPermissao();
+      if (!mounted) return;
+      if (!ok) {
+        aviso(context,
+            'Sem permissao para notificacoes. Ativa nas definicoes do telemovel.');
+        return;
+      }
+    }
+    await Db.guardarConfig('lembretes', v ? '1' : '0');
+    if (!mounted) return;
+    setState(() => lembretesAtivos = v);
+    await reagendarLembretes();
+  }
+
+  // Escolhe a hora dos avisos
+  Future<void> escolherHora() async {
+    final t = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay(hour: horaLembrete, minute: 0),
+    );
+    if (t == null) return;
+    await Db.guardarConfig('lembrete_hora', '${t.hour}');
+    if (!mounted) return;
+    setState(() => horaLembrete = t.hour);
+    await reagendarLembretes();
+  }
+
+  // Mostra uma notificacao de teste
+  Future<void> testarLembrete() async {
+    final ok = await Lembretes.pedirPermissao();
+    if (!mounted) return;
+    if (!ok) {
+      aviso(context, 'Sem permissao para notificacoes.');
+      return;
+    }
+    await Lembretes.testar();
+    if (!mounted) return;
+    aviso(context, 'Notificacao de teste enviada.');
+  }
 
   // Copia todos os dados para a area de transferencia
   Future<void> copiarSeguranca() async {
@@ -1240,6 +1413,35 @@ class _ConfigPageState extends State<ConfigPage> {
               );
             }),
           ),
+
+          // Lembretes (so no Android)
+          if (ehAndroid) ...[
+            const SizedBox(height: 28),
+            const Text('Lembretes',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Avisar antes de cada ronda'),
+              subtitle: const Text(
+                  'No dia anterior e no proprio dia, sem precisar de internet'),
+              value: lembretesAtivos,
+              onChanged: mudarLembretes,
+            ),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              enabled: lembretesAtivos,
+              title: const Text('Hora do aviso'),
+              trailing:
+                  Text('${horaLembrete.toString().padLeft(2, '0')}:00'),
+              onTap: lembretesAtivos ? escolherHora : null,
+            ),
+            OutlinedButton.icon(
+              icon: const Icon(Icons.notifications_active),
+              label: const Text('Testar notificacao agora'),
+              onPressed: testarLembrete,
+            ),
+          ],
+
           const SizedBox(height: 28),
           const Text('Copia de seguranca',
               style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
@@ -2228,6 +2430,17 @@ class _GrupoPageState extends State<GrupoPage>
                 ClipboardData(text: c.resumoRonda(rondaSel)));
             if (!mounted) return;
             aviso(context, 'Resumo copiado. Cola no WhatsApp.');
+          },
+        ),
+        // Copiar o relatorio completo do grupo
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
+          icon: const Icon(Icons.description),
+          label: const Text('Copiar relatorio completo'),
+          onPressed: () async {
+            await Clipboard.setData(ClipboardData(text: c.relatorioCompleto()));
+            if (!mounted) return;
+            aviso(context, 'Relatorio copiado.');
           },
         ),
         // Enviar o resumo pelo WhatsApp (so no Android)
