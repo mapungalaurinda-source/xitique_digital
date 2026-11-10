@@ -1,0 +1,23 @@
+# Compila a app para o SIMULADOR iOS (sem conta Apple paga)
+workflows:
+  ios-simulador:
+    name: iOS Simulador
+    max_build_duration: 30
+    instance_type: mac_mini_m2
+    environment:
+      flutter: stable
+      xcode: latest
+    scripts:
+      - name: Instalar dependencias
+        script: flutter pub get
+      - name: Compilar para simulador iOS
+        script: flutter build ios --simulator --debug
+      - name: Criar zip para o Appetize
+        script: |
+          APP=$(find build/ios -name "Runner.app" -type d | head -n 1)
+          echo "App encontrada em: $APP"
+          mkdir -p build/saida
+          cd "$(dirname "$APP")"
+          zip -r "$CM_BUILD_DIR/build/saida/Runner.zip" Runner.app
+    artifacts:
+      - build/saida/Runner.zip
